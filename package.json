@@ -1,0 +1,29 @@
+{
+  "name": "github-code-scanning-aws-alarms",
+  "version": "0.1.0",
+  "bin": {
+    "app": "bin/app.ts"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "ts-node-dev --respawn bin/app.ts",
+    "cdk": "cdk",
+    "deploy": "cdk deploy",
+    "synth": "cdk synth",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@aws-cdk/assertions": "^1.204.0",
+    "@aws-sdk/client-cloudwatch": "^3.826.0",
+    "@aws-sdk/client-s3": "^3.826.0",
+    "@aws-sdk/client-sns": "^3.826.0",
+    "@types/node": "^24.0.0",
+    "aws-cdk": "^2.1018.0",
+    "aws-cdk-lib": "^2.200.1",
+    "cdk-nag": "^2.36.14",
+    "constructs": "^10.4.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3",
+    "undici": "^7.10.0"
+  }
+}
