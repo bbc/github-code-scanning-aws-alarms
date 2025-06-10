@@ -10,17 +10,15 @@ const { GithubCodeScanningMonitorStack } = requireTs('../lib/github-code-scannin
 function synthStack() {
   const app = new App({
     context: {
-      githubOwner: 'dummy',
-      githubRepo: 'repo',
-      githubBranch: 'main',
-      codestarConnectionArn: 'arn:aws:codestar-connections:us-east-1:123456789012:connection/abcd',
+      repos: [
+        { owner: 'dummy', repo: 'repo', branch: 'main' },
+      ],
     },
   });
   const stack = new GithubCodeScanningMonitorStack(app, 'TestStack', {
-    githubOwner: 'dummy',
-    githubRepo: 'repo',
-    githubBranch: 'main',
-    codestarConnectionArn: 'arn:aws:codestar-connections:us-east-1:123456789012:connection/abcd',
+    repos: [
+      { owner: 'dummy', repo: 'repo', branch: 'main' },
+    ],
   });
   Aspects.of(app).add(new AwsSolutionsChecks({ verbose: true }));
   const assembly = app.synth();

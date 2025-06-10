@@ -19,11 +19,14 @@ import {
 } from 'aws-cdk-lib';
 import type { Construct } from 'constructs';
 
+export interface RepoTarget {
+  owner: string;
+  repo: string;
+  branch: string;
+}
+
 export interface GithubCodeScanningMonitorStackProps extends StackProps {
-  githubOwner: string;
-  githubRepo: string;
-  githubBranch: string;
-  codestarConnectionArn: string;
+  repos: RepoTarget[];
   notificationEmail?: string;
   scheduleExpression?: string;
 }
@@ -33,15 +36,11 @@ export class GithubCodeScanningMonitorStack extends Stack {
     super(scope, id, props);
 
     const {
-      githubOwner,
-      githubRepo,
-      githubBranch,
-      codestarConnectionArn,
+      repos,
       notificationEmail,
       scheduleExpression,
     } = props;
 
-    // CODEBUILD ------------------------------------------------------------
     const accountId = Stack.of(this).account;
     const bucketName = /^[0-9]{12}$/.test(accountId) ? `github-scanning-alerts-${accountId}` : undefined;
     const alertsBucket = new s3.Bucket(this, 'AlertsBucket', {
@@ -52,11 +51,8 @@ export class GithubCodeScanningMonitorStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
     });
 
-    const sourceOutput = new codepipeline.Artifact();
-    const buildOutput = new codepipeline.Artifact('BuildOutput');
-
     const githubTokenSecret = new secretsmanager.Secret(this, 'GithubTokenSecret', {
-      description: `GitHub PAT for ${githubOwner}/${githubRepo} code scanning monitor`,
+      description: "GitHub PAT for GitHub code scanning monitor",
       secretName: `github-scanning-alerts-${accountId}-github-pat`,
     });
 
@@ -66,7 +62,7 @@ export class GithubCodeScanningMonitorStack extends Stack {
     let alertTopic: sns.Topic | undefined;
     if (notificationEmail) {
       alertTopic = new sns.Topic(this, 'AlertTopic', {
-        displayName: `GitHub Code Scanning Alerts - ${githubOwner}/${githubRepo}`,
+        displayName: "GitHub Code Scanning Alerts",
       });
       alertTopic.addSubscription(new subscriptions.EmailSubscription(notificationEmail));
     }
@@ -75,98 +71,119 @@ export class GithubCodeScanningMonitorStack extends Stack {
       path: require('node:path').join(__dirname, '..', 'assets', 'scanner'),
     });
 
-    const buildProject = new codebuild.PipelineProject(this, 'ScanDiffProject', {
-      environment: {
-        buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
-        privileged: false,
-      },
-      environmentVariables: {
-        GITHUB_OWNER: { value: githubOwner },
-        GITHUB_REPO: { value: githubRepo },
-        GITHUB_BRANCH: { value: githubBranch },
-        METRIC_NAMESPACE: { value: metricNamespace },
-        METRIC_NAME: { value: metricName },
-        ALERTS_OBJECT_KEY: { value: `${githubOwner}/${githubRepo}/latest.json` },
-        ALERTS_BUCKET: { value: alertsBucket.bucketName },
-        GITHUB_TOKEN: { value: githubTokenSecret.secretArn, type: codebuild.BuildEnvironmentVariableType.SECRETS_MANAGER },
-        SCANNER_BUCKET: { value: scannerAsset.s3BucketName },
-        SCANNER_KEY: { value: scannerAsset.s3ObjectKey },
-        ...(notificationEmail && alertTopic ? { SNS_TOPIC_ARN: { value: alertTopic.topicArn } } : {}),
-      },
-      buildSpec: codebuild.BuildSpec.fromObject({
-        version: '0.2',
-        phases: {
-          install: {
-            'runtime-versions': {
-              nodejs: '22'
-            },
-            commands: [
-              'npm install -g jq',
-              'npm install @aws-sdk/client-s3 @aws-sdk/client-cloudwatch @aws-sdk/client-sns undici'
-            ]
-          },
-          pre_build: {
-            commands: [
-              'echo "Fetching previous alerts (if any)"',
-              'aws s3 cp s3://$ALERTS_BUCKET/$ALERTS_OBJECT_KEY old_alerts.json || echo "[]" > old_alerts.json'
-            ]
-          },
-          build: {
-            commands: [
-              'echo "Downloading scanner script asset"',
-              'aws s3 cp s3://$SCANNER_BUCKET/$SCANNER_KEY scanner.mjs'
-            ]
-          },
-          post_build: {
-            commands: [
-              'node --no-warnings=Experimental scanner.mjs',
-              'aws s3 cp /tmp/current-alerts.json s3://$ALERTS_BUCKET/$ALERTS_OBJECT_KEY',
-              'echo "Stored latest alerts JSON to S3"'
-            ]
-          }
-        },
-        artifacts: {
-          files: ['new_alerts.json'],
-          discardPaths: 'yes',
-        },
-      }),
-    });
-
-    githubTokenSecret.grantRead(buildProject);
-    alertsBucket.grantReadWrite(buildProject);
-    scannerAsset.grantRead(buildProject);
-
-    // CODEPIPELINE -----------------------------------------------------------
     const pipeline = new codepipeline.Pipeline(this, 'GithubAlertMonitorPipeline', {
-      pipelineName: `${githubOwner}-${githubRepo}-code-scanning-monitor`,
+      pipelineName: "github-code-scanning-monitor",
       pipelineType: codepipeline.PipelineType.V2,
       crossAccountKeys: false,
     });
 
+    const placeholderArtifact = new codepipeline.Artifact('Placeholder');
     pipeline.addStage({
       stageName: 'Source',
       actions: [
-        new actions.CodeStarConnectionsSourceAction({
-          actionName: 'GitHub_Source',
-          owner: githubOwner,
-          repo: githubRepo,
-          branch: githubBranch,
-          connectionArn: codestarConnectionArn,
-          output: sourceOutput,
+        new actions.S3SourceAction({
+          actionName: 'DummySource',
+          bucket: alertsBucket, 
+          bucketKey: 'placeholder.zip', 
+          output: placeholderArtifact,
+          trigger: actions.S3Trigger.NONE,
         }),
       ],
     });
 
-    pipeline.addStage({
-      stageName: 'ScanComparison',
-      actions: [
-        new actions.CodeBuildAction({
-          actionName: 'Compare_Alerts',
-          project: buildProject,
-          input: sourceOutput,
-          outputs: [buildOutput],
+    const scanStage = pipeline.addStage({ stageName: 'ScanRepos' });
+
+    repos.forEach((target, idx) => {
+      const { owner, repo, branch } = target;
+
+      const project = new codebuild.PipelineProject(this, `ScanDiffProject_${idx}`, {
+        environment: {
+          buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
+          privileged: false,
+        },
+        environmentVariables: {
+          GITHUB_OWNER: { value: owner },
+          GITHUB_REPO: { value: repo },
+          GITHUB_BRANCH: { value: branch },
+          METRIC_NAMESPACE: { value: metricNamespace },
+          METRIC_NAME: { value: metricName },
+          ALERTS_OBJECT_KEY: { value: `${owner}/${repo}/latest.json` },
+          ALERTS_BUCKET: { value: alertsBucket.bucketName },
+          GITHUB_TOKEN: { value: githubTokenSecret.secretArn, type: codebuild.BuildEnvironmentVariableType.SECRETS_MANAGER },
+          SCANNER_BUCKET: { value: scannerAsset.s3BucketName },
+          SCANNER_KEY: { value: scannerAsset.s3ObjectKey },
+          ...(notificationEmail && alertTopic ? { SNS_TOPIC_ARN: { value: alertTopic.topicArn } } : {}),
+        },
+        buildSpec: codebuild.BuildSpec.fromObject({
+          version: '0.2',
+          phases: {
+            install: {
+              'runtime-versions': { nodejs: '22' },
+              commands: [
+                'npm install -g jq',
+                'npm install @aws-sdk/client-s3 @aws-sdk/client-cloudwatch @aws-sdk/client-sns undici'
+              ]
+            },
+            pre_build: {
+              commands: [
+                'echo "Fetching previous alerts (if any)"',
+                'aws s3 cp s3://$ALERTS_BUCKET/$ALERTS_OBJECT_KEY old_alerts.json || echo "[]" > old_alerts.json'
+              ]
+            },
+            build: {
+              commands: [
+                'echo "Downloading scanner script asset"',
+                'aws s3 cp s3://$SCANNER_BUCKET/$SCANNER_KEY scanner.mjs'
+              ]
+            },
+            post_build: {
+              commands: [
+                'node --no-warnings=Experimental scanner.mjs',
+                'aws s3 cp /tmp/current-alerts.json s3://$ALERTS_BUCKET/$ALERTS_OBJECT_KEY',
+                'echo "Stored latest alerts JSON to S3"'
+              ]
+            }
+          },
+          artifacts: {
+            files: ['new_alerts.json'],
+            discardPaths: 'yes',
+          },
         }),
-      ],
+      });
+
+      githubTokenSecret.grantRead(project);
+      alertsBucket.grantReadWrite(project);
+      scannerAsset.grantRead(project);
+
+      scanStage.addAction(new actions.CodeBuildAction({
+        actionName: `${owner}_${repo}`.replace(/[^A-Za-z0-9]/g, '_').slice(0, 50),
+        project,
+        input: placeholderArtifact,
+      }));
+
+      const metric = new cloudwatch.Metric({
+        namespace: metricNamespace,
+        metricName: metricName,
+        period: Duration.minutes(5),
+        statistic: 'Maximum',
+        dimensionsMap: { Repo: `${owner}/${repo}` },
+      });
+
+      const alarm = new cloudwatch.Alarm(this, `NewAlertsAlarm${idx}`, {
+        metric,
+        threshold: 0,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        alarmDescription: `Alarm if new GitHub code scanning alerts are detected for ${owner}/${repo}`,
+      });
+
+      if (notificationEmail && alertTopic) {
+        alarm.addAlarmAction(new cw_actions.SnsAction(alertTopic));
+      }
+
+      new CfnOutput(this, `BuildProjectName${idx}`, { value: project.projectName });
+      new CfnOutput(this, `AlarmName${idx}`, { value: alarm.alarmName });
     });
 
     if (scheduleExpression) {
@@ -176,44 +193,8 @@ export class GithubCodeScanningMonitorStack extends Stack {
       rule.addTarget(new targets.CodePipeline(pipeline));
     }
 
-    // CLOUDWATCH ------------------------------------------------------------
-    const metric = new cloudwatch.Metric({
-      namespace: metricNamespace,
-      metricName: metricName,
-      period: Duration.minutes(5),
-      statistic: 'Maximum',
-    });
-
-    const newAlertsAlarm = new cloudwatch.Alarm(this, 'NewAlertsAlarm', {
-      metric,
-      threshold: 0,
-      evaluationPeriods: 1,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-      alarmDescription: `Alarm if new GitHub code scanning alerts are detected for ${githubOwner}/${githubRepo}`,
-    });
-
-    if (notificationEmail && alertTopic) {
-      newAlertsAlarm.addAlarmAction(new cw_actions.SnsAction(alertTopic));
-    }
-
-    // OUTPUTS ------------------------------------------------------------
     new CfnOutput(this, 'AlertsBucketName', {
       value: alertsBucket.bucketName,
     });
-
-    new CfnOutput(this, 'BuildProjectName', {
-      value: buildProject.projectName,
-    });
-
-    new CfnOutput(this, 'AlarmName', {
-      value: newAlertsAlarm.alarmName,
-    });
-
-    if (notificationEmail && alertTopic) {
-      new CfnOutput(this, 'AlarmTopicArn', {
-        value: alertTopic.topicArn,
-      });
-    }
   }
 }
